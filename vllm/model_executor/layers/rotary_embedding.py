@@ -155,6 +155,21 @@ class RotaryEmbedding(nn.Module):
             ops.rotary_embedding(positions, query, key, self.head_size,
                                  self.cos_sin_cache, self.is_neox_style)
         return query, key
+    
+    def _forward_fp8(
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        q_scale: torch.Tensor,
+        key: torch.Tensor,
+        k_scale: torch.Tensor,
+        offsets: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        self.cos_sin_cache = self.cos_sin_cache.to(positions.device)
+
+        ops.rotary_embedding_fp8(positions, query, q_scale, key, k_scale, self.head_size,
+                                self.cos_sin_cache, self.is_neox_style)
+        return query, q_scale, key, k_scale
 
 
 class LinearScalingRotaryEmbedding(RotaryEmbedding):

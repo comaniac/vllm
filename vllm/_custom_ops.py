@@ -89,6 +89,18 @@ def rotary_embedding(
     vllm_ops.rotary_embedding(positions, query, key, head_size, cos_sin_cache,
                               is_neox)
 
+def rotary_embedding_fp8(
+    positions: torch.Tensor,
+    query: torch.Tensor,
+    q_scale: torch.Tensor,
+    key: torch.Tensor,
+    k_scale: torch.Tensor,
+    head_size: int,
+    cos_sin_cache: torch.Tensor,
+    is_neox: bool,
+) -> None:
+    vllm_ops.rotary_embedding_fp8(positions, query, q_scale, key, k_scale, head_size, cos_sin_cache,
+                              is_neox)
 
 def batched_rotary_embedding(positions: torch.Tensor, query: torch.Tensor,
                              key: torch.Tensor, head_size: int,

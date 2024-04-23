@@ -55,6 +55,18 @@ void rotary_embedding(
   torch::Tensor& cos_sin_cache,
   bool is_neox);
 
+
+void rotary_embedding_fp8(
+  torch::Tensor& positions,
+  torch::Tensor& query,
+  torch::Tensor& q_scale,
+  torch::Tensor& key,
+  torch::Tensor& k_scale,
+  int head_size,
+  torch::Tensor& cos_sin_cache,
+  bool is_neox);
+
+
 void batched_rotary_embedding(
   torch::Tensor& positions,
   torch::Tensor& query,
