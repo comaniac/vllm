@@ -82,25 +82,28 @@ def rotary_embedding(
     positions: torch.Tensor,
     query: torch.Tensor,
     key: torch.Tensor,
+    out_query: torch.Tensor,
+    out_key: torch.Tensor,
     head_size: int,
     cos_sin_cache: torch.Tensor,
     is_neox: bool,
+    q_scale: Optional[torch.Tensor] = None,
+    k_scale: Optional[torch.Tensor] = None,
 ) -> None:
-    vllm_ops.rotary_embedding(positions, query, key, head_size, cos_sin_cache,
-                              is_neox)
+    # When any of the scales is None, we apply dynamic scaling that
+    # generates scaling factors on the fly.
+    output_dtype = "fp8" if out_query.dtype == torch.float8_e4m3fn else "auto"
+    fp8_dynamic_scale = False
+    if q_scale is None or k_scale is None:
+        q_scale = torch.zeros((1, ), device=query.device, dtype=torch.float32)
+        k_scale = torch.zeros((1, ), device=query.device, dtype=torch.float32)
+        fp8_dynamic_scale = True
 
-def rotary_embedding_fp8(
-    positions: torch.Tensor,
-    query: torch.Tensor,
-    q_scale: torch.Tensor,
-    key: torch.Tensor,
-    k_scale: torch.Tensor,
-    head_size: int,
-    cos_sin_cache: torch.Tensor,
-    is_neox: bool,
-) -> None:
-    vllm_ops.rotary_embedding_fp8(positions, query, q_scale, key, k_scale, head_size, cos_sin_cache,
-                              is_neox)
+    vllm_ops.rotary_embedding(positions, query, q_scale, key, k_scale,
+                              out_query, out_key, head_size, cos_sin_cache,
+                              output_dtype, is_neox, fp8_dynamic_scale)
+    return q_scale, k_scale
+
 
 def batched_rotary_embedding(positions: torch.Tensor, query: torch.Tensor,
                              key: torch.Tensor, head_size: int,

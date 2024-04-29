@@ -50,22 +50,16 @@ void fused_add_rms_norm(
 void rotary_embedding(
   torch::Tensor& positions,
   torch::Tensor& query,
+  torch::Tensor& qscale,
   torch::Tensor& key,
+  torch::Tensor& kscale,
+  torch::Tensor& out_query,
+  torch::Tensor& out_key,
   int head_size,
   torch::Tensor& cos_sin_cache,
-  bool is_neox);
-
-
-void rotary_embedding_fp8(
-  torch::Tensor& positions,
-  torch::Tensor& query,
-  torch::Tensor& q_scale,
-  torch::Tensor& key,
-  torch::Tensor& k_scale,
-  int head_size,
-  torch::Tensor& cos_sin_cache,
-  bool is_neox);
-
+  const std::string& output_dtype,
+  bool is_neox,
+  bool fp8_dynamic_scale);
 
 void batched_rotary_embedding(
   torch::Tensor& positions,

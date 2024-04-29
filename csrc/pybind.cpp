@@ -57,11 +57,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     "Apply GPT-NeoX or GPT-J style rotary embedding to query and key");
 
   ops.def(
-    "rotary_embedding_fp8",
-    &rotary_embedding_fp8,
-    "Apply GPT-NeoX or GPT-J style rotary embedding to query and key");
-
-  ops.def(
     "batched_rotary_embedding",
     &batched_rotary_embedding,
     "Apply GPT-NeoX or GPT-J style rotary embedding to query and key (supports multiple loras)");
