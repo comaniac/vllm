@@ -168,10 +168,13 @@ class FlashInferImpl(AttentionImpl):
         alibi_slopes: Optional[List[float]],
         sliding_window: Optional[int],
         kv_cache_dtype: str,
+        blocksparse_params: Optional[Dict[str, Any]] = None,
     ) -> None:
         self.num_heads = num_heads
         self.head_size = head_size
         self.scale = float(scale)
+        assert blocksparse_params is None, ValueError(
+            "FlashAttention does not support block-sparse attention.")
         self.num_kv_heads = num_kv_heads
         if alibi_slopes is not None:
             alibi_slopes = torch.tensor(alibi_slopes, dtype=torch.float32)
@@ -180,6 +183,11 @@ class FlashInferImpl(AttentionImpl):
             raise ValueError("Sliding window is not supported in FlashInfer.")
         self.sliding_window = (-1, -1)
         self.kv_cache_dtype = kv_cache_dtype
+        self.kv_cache_torch_dtype = None
+        if self.kv_cache_dtype in ("fp8", "fp8_e4m3"):
+            self.kv_cache_torch_dtype = torch.float8_e4m3fn
+        elif self.kv_cache_dtype == "fp8_e5m2":
+            self.kv_cache_torch_dtype = torch.float8_e5m2
 
         assert self.num_heads % self.num_kv_heads == 0
         self.num_queries_per_kv = self.num_heads // self.num_kv_heads
@@ -193,7 +201,6 @@ class FlashInferImpl(AttentionImpl):
         attn_metadata: FlashInferMetadata,
         kv_scale: float = 1.0,
     ) -> torch.Tensor:
-        assert kv_scale == 1.0
         num_tokens, hidden_size = query.shape
         query = query.view(-1, self.num_heads, self.head_size)
         key = key.view(-1, self.num_kv_heads, self.head_size)
@@ -215,6 +222,7 @@ class FlashInferImpl(AttentionImpl):
                 kv_cache[:, 1],
                 attn_metadata.slot_mapping.flatten(),
                 self.kv_cache_dtype,
+                kv_scale,
             )
 
         if prefill_meta := attn_metadata.prefill_metadata:
@@ -242,6 +250,9 @@ class FlashInferImpl(AttentionImpl):
             assert attn_metadata.decode_metadata.decode_wrapper is not None
             query = query.contiguous(
             )  # Flashinfer requires query to be contiguous
+            if self.kv_cache_torch_dtype is not None:
+                kv_cache = kv_cache.view(dtype=self.kv_cache_torch_dtype)
+            # FIXME: Update API
             output = attn_metadata.decode_metadata.decode_wrapper.forward(
                 query,
                 kv_cache,
