@@ -1,4 +1,5 @@
 import argparse
+import array
 import asyncio
 import contextlib
 import datetime
@@ -712,6 +713,14 @@ def merge_dicts(dict1: Dict[K, List[T]],
 def flatten_2d_lists(lists: List[List[T]]) -> List[T]:
     """Flatten a list of lists to a single list."""
     return [item for sublist in lists for item in sublist]
+
+
+def flatten_2d_arrays(arrays: List[array.array]) -> array.array:
+    """Flatten a list of arrays to a single array."""
+    ret = array.array(arrays[0].typecode)
+    for arr in arrays:
+        ret.extend(arr)
+    return ret
 
 
 def init_cached_hf_modules() -> None:

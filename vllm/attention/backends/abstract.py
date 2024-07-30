@@ -1,3 +1,4 @@
+import array
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, fields
 from enum import Enum, auto
@@ -131,7 +132,7 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         raise NotImplementedError
 
     @abstractmethod
-    def build(self, seq_lens: List[int], query_lens: List[int],
+    def build(self, seq_lens: array.array, query_lens: array.array,
               cuda_graph_pad_size: int, batch_size: int) -> T:
         """Build attention metadata with on-device tensors."""
         raise NotImplementedError

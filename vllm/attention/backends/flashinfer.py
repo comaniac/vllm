@@ -1,3 +1,4 @@
+import array
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple, Type
 
@@ -205,12 +206,11 @@ class FlashInferMetadata(AttentionMetadata):
 class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
 
     def __init__(self, input_builder: "ModelInputForGPUBuilder"):
-        self.slot_mapping: List[int] = []
-        self.prefill_seq_lens: List[int] = []
-        self.context_lens: List[int] = []
-        self.block_tables: List[List[int]] = []
-        self.curr_seq_lens: List[int] = []
+        self.slot_mapping: array.array = array.array("l")
+        self.context_lens: array.array = array.array("l")
+        self.block_tables: List[array.array] = []
         self.num_prefills = 0
+        self.max_prefill_seq_len: int = 0
         self.num_prefill_tokens = 0
         self.num_decode_tokens = 0
 
@@ -232,12 +232,12 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         # [0, 5, 8, 1, 6, 7, 3, 4]
         # paged_kv_indptr is used to index into paged_kv_indices:
         # [0, 3, 6, 8]
-        self.paged_kv_indices: List[int] = []
+        self.paged_kv_indices: array.array = array.array("l")
         # 0 at the beginning of paged_kv_indptr indicates the start of the
         # first request’s page indices in the paged_kv_indices list.
-        self.paged_kv_indptr: List[int] = [0]
+        self.paged_kv_indptr: array.array = array.array("l", [0])
         # paged_kv_last_page_len is the length of the last page of each request
-        self.paged_kv_last_page_len: List[int] = []
+        self.paged_kv_last_page_len: array.array = array.array("l")
 
     def _add_seq_group(
             self, inter_data: "ModelInputForGPUBuilder.InterDataForSeqGroup",
@@ -251,7 +251,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         block_tables = inter_data.block_tables
         computed_block_nums = inter_data.computed_block_nums
 
-        for (seq_id, token_len, seq_len, curr_seq_len, query_len, context_len,
+        for (seq_id, token_len, seq_len, _, query_len, context_len,
              curr_sliding_window_block) in zip(
                  inter_data.seq_ids, [len(t) for t in inter_data.input_tokens],
                  inter_data.orig_seq_lens, inter_data.seq_lens,
@@ -261,13 +261,13 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             if is_prompt:
                 self.num_prefills += 1
                 self.num_prefill_tokens += token_len
-                self.prefill_seq_lens.append(seq_len)
+                self.max_prefill_seq_len = max(self.max_prefill_seq_len,
+                                               seq_len)
             else:
                 assert query_len == 1, (
                     "seq_len: {}, context_len: {}, query_len: {}".format(
                         seq_len, context_len, query_len))
                 self.num_decode_tokens += query_len
-                self.curr_seq_lens.append(curr_seq_len)
 
             # Compute block table.
             # TODO(sang): Combine chunked prefill and prefix caching by
@@ -279,7 +279,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             elif ((chunked_prefill_enabled or not is_prompt)
                   and block_tables is not None):
                 block_table = block_tables[seq_id][-curr_sliding_window_block:]
-            self.block_tables.append(block_table)
+            self.block_tables.append(array.array("l", block_table))
 
             is_profile_run = is_block_tables_empty(block_tables)
 
@@ -318,7 +318,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             last_page_len = self.block_size
         self.paged_kv_last_page_len.append(last_page_len)
 
-    def build(self, seq_lens: List[int], query_lens: List[int],
+    def build(self, seq_lens: array.array, query_lens: array.array,
               cuda_graph_pad_size: int, batch_size: int):
         """Build attention metadata with on-device tensors.
 
@@ -337,7 +337,6 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         use_captured_graph = cuda_graph_pad_size != -1
 
         max_query_len = max(query_lens)
-        max_prefill_seq_len = max(self.prefill_seq_lens, default=0)
         num_decode_tokens = self.num_decode_tokens
 
         if use_captured_graph:
@@ -415,7 +414,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             slot_mapping=slot_mapping_tensor,
             num_prefill_tokens=self.num_prefill_tokens,
             num_decode_tokens=num_decode_tokens,
-            max_prefill_seq_len=max_prefill_seq_len,
+            max_prefill_seq_len=self.max_prefill_seq_len,
             block_tables=block_tables,
             paged_kv_indptr=paged_kv_indptr_tensor,
             paged_kv_indices=paged_kv_indices_tensor,

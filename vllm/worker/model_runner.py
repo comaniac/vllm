@@ -1,3 +1,4 @@
+import array
 import dataclasses
 import gc
 import time
@@ -49,8 +50,8 @@ from vllm.prompt_adapter.worker_manager import (
 from vllm.sampling_params import SamplingParams
 from vllm.sequence import (IntermediateTensors, SamplerOutput,
                            SequenceGroupMetadata)
-from vllm.utils import (CudaMemoryProfiler, flatten_2d_lists,
-                        get_kv_cache_torch_dtype, is_hip,
+from vllm.utils import (CudaMemoryProfiler, flatten_2d_arrays,
+                        flatten_2d_lists, get_kv_cache_torch_dtype, is_hip,
                         is_pin_memory_available)
 from vllm.worker.model_runner_base import (
     ModelRunnerBase, ModelRunnerInputBase, ModelRunnerInputBuilderBase,
@@ -189,20 +190,20 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
             n_seqs: int = 0,
 
             # Input tokens and positions.
-            input_tokens: Optional[List[List[int]]] = None,
-            input_positions: Optional[List[List[int]]] = None,
+            input_tokens: Optional[List[array.array]] = None,
+            input_positions: Optional[List[array.array]] = None,
 
             # The sequence length (may be capped to the sliding window).
-            seq_lens: Optional[List[int]] = None,
+            seq_lens: Optional[array.array] = None,
             # The original sequence length (before applying sliding window).
             # This is used to compute slot mapping.
-            orig_seq_lens: Optional[List[int]] = None,
+            orig_seq_lens: Optional[array.array] = None,
             # The query length.
-            query_lens: Optional[List[int]] = None,
+            query_lens: Optional[array.array] = None,
             # The number of tokens that are already computed.
-            context_lens: Optional[List[int]] = None,
+            context_lens: Optional[array.array] = None,
             # The current sliding window block.
-            curr_sliding_window_blocks: Optional[List[int]] = None,
+            curr_sliding_window_blocks: Optional[Optional[array.array]] = None,
 
             # LoRA inputs.
             lora_index_mapping: Optional[List[List[int]]] = None,
@@ -228,11 +229,12 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
             self.n_seqs = n_seqs
             self.input_tokens = input_tokens or []
             self.input_positions = input_positions or []
-            self.seq_lens = seq_lens or []
-            self.orig_seq_lens = orig_seq_lens or []
-            self.query_lens = query_lens or []
-            self.context_lens = context_lens or []
-            self.curr_sliding_window_blocks = curr_sliding_window_blocks or []
+            self.seq_lens = seq_lens or array.array("l")
+            self.orig_seq_lens = orig_seq_lens or array.array("l")
+            self.query_lens = query_lens or array.array("l")
+            self.context_lens = context_lens or array.array("l")
+            self.curr_sliding_window_blocks = (curr_sliding_window_blocks
+                                               or array.array("l"))
 
             self.lora_index_mapping = lora_index_mapping or []
             self.lora_prompt_mapping = lora_prompt_mapping or []
@@ -252,13 +254,16 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
         def __post_init__(self):
             self.n_seqs = len(self.seq_ids)
 
-            self.input_tokens = [[] for _ in range(self.n_seqs)]
-            self.input_positions = [[] for _ in range(self.n_seqs)]
-            self.seq_lens = [0] * self.n_seqs
-            self.orig_seq_lens = [0] * self.n_seqs
-            self.query_lens = [0] * self.n_seqs
-            self.context_lens = [0] * self.n_seqs
-            self.curr_sliding_window_blocks = [0] * self.n_seqs
+            self.input_tokens = [array.array("l") for _ in range(self.n_seqs)]
+            self.input_positions = [
+                array.array("l") for _ in range(self.n_seqs)
+            ]
+            self.seq_lens = array.array("l", [0] * self.n_seqs)
+            self.orig_seq_lens = array.array("l", [0] * self.n_seqs)
+            self.query_lens = array.array("l", [0] * self.n_seqs)
+            self.context_lens = array.array("l", [0] * self.n_seqs)
+            self.curr_sliding_window_blocks = array.array(
+                "l", [0] * self.n_seqs)
 
             self.lora_index_mapping = [[] for _ in range(self.n_seqs)]
             self.lora_prompt_mapping = [[] for _ in range(self.n_seqs)]
@@ -336,17 +341,19 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
 
         # Compute tokens.
         if inter_data.is_prompt:
-            tokens = seq_data.get_token_ids()[context_len:seq_len]
+            tokens = array.array("l",
+                                 seq_data.get_token_ids()[context_len:seq_len])
         else:
             # Optimization. get_token_ids requires the entire copy of
             # tokens.
-            tokens = [seq_data.get_last_token_id()]
+            tokens = array.array("l", [seq_data.get_last_token_id()])
 
         inter_data.seq_lens[seq_idx] = seq_len
         inter_data.orig_seq_lens[seq_idx] = seq_len
         inter_data.context_lens[seq_idx] = context_len
         inter_data.input_tokens[seq_idx] = tokens
-        inter_data.input_positions[seq_idx] = list(range(context_len, seq_len))
+        inter_data.input_positions[seq_idx] = array.array(
+            "l", list(range(context_len, seq_len)))
         inter_data.query_lens[
             seq_idx] = seq_len - context_len if inter_data.is_prompt else 1
 
@@ -503,26 +510,26 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
         create on-device tensors.
         """
         # Combine and flatten intermediate data.
-        input_tokens = flatten_2d_lists([
-            flatten_2d_lists(inter_data.input_tokens)
+        input_tokens = flatten_2d_arrays([
+            flatten_2d_arrays(inter_data.input_tokens)
             for inter_data in self.inter_data_list
         ])
         if not input_tokens:
             # This may happen when all prefill requests hit
             # prefix caching and there is no decode request.
             return self.model_input_cls()
-        input_positions = flatten_2d_lists([
-            flatten_2d_lists(inter_data.input_positions)
+        input_positions = flatten_2d_arrays([
+            flatten_2d_arrays(inter_data.input_positions)
             for inter_data in self.inter_data_list
         ])
-        seq_lens = []
+        seq_lens = array.array("l")
         max_decode_seq_len = 0
         for inter_data in self.inter_data_list:
             seq_lens.extend(inter_data.seq_lens)
             if not inter_data.is_prompt:
                 max_decode_seq_len = max(max_decode_seq_len,
                                          max(inter_data.seq_lens))
-        query_lens = flatten_2d_lists(
+        query_lens = flatten_2d_arrays(
             [inter_data.query_lens for inter_data in self.inter_data_list])
         # Mapping from request IDs to sequence IDs. Used for Jamba models
         # that manages the cache by itself.

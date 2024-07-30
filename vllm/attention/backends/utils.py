@@ -1,4 +1,5 @@
 """Attention backend utils"""
+import array
 from typing import TYPE_CHECKING, Dict, List, Type, TypeVar, Union
 
 import torch
@@ -46,7 +47,7 @@ def compute_slot_mapping_start_idx(is_prompt: bool, query_len: int,
     return start_idx
 
 
-def compute_slot_mapping(is_profile_run: bool, slot_mapping: List[int],
+def compute_slot_mapping(is_profile_run: bool, slot_mapping: array.array,
                          seq_id: int, seq_len: int, context_len: int,
                          start_idx: int, block_size: int,
                          block_tables: Dict[int, List[int]]):
@@ -84,11 +85,11 @@ class CommonMetadataBuilder(AttentionMetadataBuilder[TAttentionMetadata]):
     _metadata_cls: Type[TAttentionMetadata]
 
     def __init__(self, input_builder: "ModelInputForGPUBuilder"):
-        self.slot_mapping: List[int] = []
-        self.prefill_seq_lens: List[int] = []
-        self.context_lens: List[int] = []
-        self.block_tables: List[List[int]] = []
-        self.curr_seq_lens: List[int] = []
+        self.slot_mapping: array.array = array.array("l")
+        self.context_lens: array.array = array.array("l")
+        self.block_tables: List[array.array] = []
+        self.max_prefill_seq_len: int = 0
+        self.max_decode_seq_len: int = 0
         self.num_prefills = 0
         self.num_prefill_tokens = 0
         self.num_decode_tokens = 0
@@ -118,13 +119,14 @@ class CommonMetadataBuilder(AttentionMetadataBuilder[TAttentionMetadata]):
             if is_prompt:
                 self.num_prefills += 1
                 self.num_prefill_tokens += token_len
-                self.prefill_seq_lens.append(seq_len)
+                self.max_prefill_seq_len = max(self.max_prefill_seq_len,
+                                               seq_len)
             else:
                 assert query_len == 1, (
                     "seq_len: {}, context_len: {}, query_len: {}".format(
                         seq_len, context_len, query_len))
                 self.num_decode_tokens += query_len
-                self.curr_seq_lens.append(curr_seq_len)
+                self.max_decode_seq_len = max(self.max_decode_seq_len, seq_len)
 
             # Compute block table.
             # TODO(sang): Combine chunked prefill and prefix caching by
@@ -136,7 +138,7 @@ class CommonMetadataBuilder(AttentionMetadataBuilder[TAttentionMetadata]):
             elif ((chunked_prefill_enabled or not is_prompt)
                   and block_tables is not None):
                 block_table = block_tables[seq_id][-curr_sliding_window_block:]
-            self.block_tables.append(block_table)
+            self.block_tables.append(array.array("l", block_table))
 
             # Compute slot mapping.
             is_profile_run = is_block_tables_empty(block_tables)
@@ -147,7 +149,7 @@ class CommonMetadataBuilder(AttentionMetadataBuilder[TAttentionMetadata]):
                                  seq_len, context_len, start_idx,
                                  self.block_size, inter_data.block_tables)
 
-    def build(self, seq_lens: List[int], query_lens: List[int],
+    def build(self, seq_lens: array.array, query_lens: array.array,
               cuda_graph_pad_size: int, batch_size: int):
         """Build attention metadata with on-device tensors.
 
@@ -175,8 +177,6 @@ class CommonMetadataBuilder(AttentionMetadataBuilder[TAttentionMetadata]):
                 "export VLLM_ATTENTION_BACKEND=FLASHINFER.")
 
         max_query_len = max(query_lens)
-        max_prefill_seq_len = max(self.prefill_seq_lens, default=0)
-        max_decode_seq_len = max(self.curr_seq_lens, default=0)
         num_decode_tokens = self.num_decode_tokens
 
         if use_captured_graph:
@@ -236,8 +236,8 @@ class CommonMetadataBuilder(AttentionMetadataBuilder[TAttentionMetadata]):
             seq_lens=seq_lens,
             seq_lens_tensor=seq_lens_tensor,
             max_query_len=max_query_len,
-            max_prefill_seq_len=max_prefill_seq_len,
-            max_decode_seq_len=max_decode_seq_len,
+            max_prefill_seq_len=self.max_prefill_seq_len,
+            max_decode_seq_len=self.max_decode_seq_len,
             query_start_loc=query_start_loc,
             seq_start_loc=seq_start_loc,
             context_lens_tensor=context_lens_tensor,
