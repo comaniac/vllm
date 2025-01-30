@@ -201,6 +201,7 @@ EXPECTED_METRICS_V1 = [
     "vllm:num_requests_running",
     "vllm:num_requests_waiting",
     "vllm:gpu_cache_usage_perc",
+    "vllm:gpu_prefix_cache_hit_rate_perc",
     "vllm:prompt_tokens_total",
     "vllm:generation_tokens_total",
     "vllm:request_prompt_tokens_sum",
