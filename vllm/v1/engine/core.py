@@ -5,6 +5,7 @@ import queue
 import signal
 import threading
 import time
+from concurrent.futures import Future
 from multiprocessing.connection import Connection
 from typing import List, Tuple, Type
 
@@ -19,12 +20,13 @@ from vllm.transformers_utils.config import (
     maybe_register_config_serialize_by_value)
 from vllm.utils import get_exception_traceback, zmq_socket_ctx
 from vllm.v1.core.kv_cache_utils import get_kv_cache_config
-from vllm.v1.core.scheduler import Scheduler
+from vllm.v1.core.scheduler import Scheduler, SchedulerOutput
 from vllm.v1.engine import (EngineCoreOutputs, EngineCoreProfile,
                             EngineCoreRequest, EngineCoreRequestType,
                             EngineCoreRequestUnion, EngineCoreResetPrefixCache)
 from vllm.v1.engine.mm_input_mapper import MMInputMapperServer
 from vllm.v1.executor.abstract import Executor
+from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.serial_utils import PickleEncoder
 from vllm.version import __version__ as VLLM_VERSION
@@ -120,6 +122,21 @@ class EngineCore:
         self.scheduler.finish_requests(request_ids,
                                        RequestStatus.FINISHED_ABORTED)
 
+    def execute_model_async(self,
+                            scheduler_output) -> Future[ModelRunnerOutput]:
+        """Run self.model_executor.execute_model in a separate thread
+        and return a future.
+        """
+        future: Future[ModelRunnerOutput] = Future()
+
+        def execute_model_thread(scheduler_output, future):
+            output = self.model_executor.execute_model(scheduler_output)
+            future.set_result(output)
+
+        threading.Thread(target=execute_model_thread,
+                         args=(scheduler_output, future)).start()
+        return future
+
     def step(self) -> EngineCoreOutputs:
         """Schedule, execute, and make output."""
 
@@ -158,13 +175,12 @@ class EngineCoreProc(EngineCore):
         super().__init__(vllm_config, executor_class)
 
         self.log_stats = log_stats
-        self.async_engine_core = vllm_config.parallel_config.distributed_executor_backend == "ray"
 
         # Background Threads and Queues for IO. These enable us to
         # overlap ZMQ socket IO with GPU since they release the GIL,
         # and to overlap some serialization/deserialization with the
         # model forward pass.
-        # Threads handle Socket <-> Queues and core_busy_loop uses Queue.            
+        # Threads handle Socket <-> Queues and core_busy_loop uses Queue.
         self.input_queue: queue.Queue[EngineCoreRequestUnion] = queue.Queue()
         self.output_queue: queue.Queue[EngineCoreOutputs] = queue.Queue()
         threading.Thread(target=self.process_input_socket,
@@ -174,10 +190,15 @@ class EngineCoreProc(EngineCore):
                          args=(output_path, ),
                          daemon=True).start()
 
-        self.microbatch_queue_size = vllm_config.parallel_config.pipeline_parallel_size
-        self.microbatch_queue = queue.Queue(self.microbatch_queue_size)
-        self.scheduler_lock = threading.Lock()        
-        threading.Thread(target=self.finish_microbatch, daemon=True).start()
+        # Background Threads and Queues for scheduled jobs. This enables
+        # us to asynchronously schedule and execute batches, and is required
+        # by pipeline parallelism to eliminate pipeline bubbles.
+        self.job_queue_size = vllm_config.parallel_config.pipeline_parallel_size
+        self.job_queue: queue.Queue[Tuple[Future[ModelRunnerOutput],
+                                          SchedulerOutput]] = queue.Queue(
+                                              self.job_queue_size)
+        self.scheduler_lock = threading.Lock()
+        threading.Thread(target=self.finish_job, daemon=True).start()
 
         # Send Readiness signal to EngineClient.
         ready_pipe.send({"status": "READY"})
@@ -222,11 +243,11 @@ class EngineCoreProc(EngineCore):
             if engine_core is not None:
                 engine_core.shutdown()
 
-    def finish_microbatch(self):
+    def finish_job(self):
         while True:
-            exe_ref, scheduler_output = self.microbatch_queue.get()
-            model_output = exe_ref.get()
-            with self.scheduler_lock: # for locking purpose
+            exe_ref, scheduler_output = self.job_queue.get()
+            model_output = exe_ref.result()
+            with self.scheduler_lock:
                 engine_core_outputs = self.scheduler.update_from_output(
                     scheduler_output, model_output)
             self.output_queue.put_nowait(engine_core_outputs)
@@ -237,33 +258,25 @@ class EngineCoreProc(EngineCore):
 
         # Loop until process is sent a SIGINT or SIGTERM
         while True:
-            with self.scheduler_lock: # for locking purpose
-                schedulable = self.scheduler.has_schedulable_requests()
-            # 1) Poll the input queue until there is work to do.
-            if not schedulable:
-                while True:
-                    try:
-                        req = self.input_queue.get(timeout=POLLING_TIMEOUT_S)
-                        self._handle_client_request(req)
-                        break
-                    except queue.Empty:
-                        logger.debug("EngineCore busy loop waiting.")
-                        # Break out the loop so we can log_stats in step().
-                        if self.log_stats:
-                            break
-                    except BaseException:
-                        raise
-
-            with self.scheduler_lock:
-                # 2) Handle any new client requests (Abort or Add).
-                while not self.input_queue.empty():
-                    req = self.input_queue.get_nowait()
+            # 1) Handle any new client requests (Abort or Add).
+            while not self.input_queue.empty():
+                req = self.input_queue.get_nowait()
+                with self.scheduler_lock:
                     self._handle_client_request(req)
-                scheduler_output = self.scheduler.schedule()
 
-            exe_ref = self.model_executor.submit_microbatch(
-                scheduler_output)
-            self.microbatch_queue.put((exe_ref, scheduler_output))
+            # 2) Schedule a batch if there are unfinished requests and
+            # the job queue has slots.
+            scheduler_output = None
+            with self.scheduler_lock:
+                if (self.scheduler.has_schedulable_requests()
+                        and not self.job_queue.full()):
+                    scheduler_output = self.scheduler.schedule()
+
+            # 3) Submit the scheduled job to the executor and put the future
+            # to the job queue.
+            if scheduler_output is not None:
+                future = self.execute_model_async(scheduler_output)
+                self.job_queue.put_nowait((future, scheduler_output))
 
     def _handle_client_request(self, request: EngineCoreRequestUnion) -> None:
         """Handle EngineCoreRequest or EngineCoreABORT from Client."""
